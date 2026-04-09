@@ -1,5 +1,5 @@
 datasource db {
-  provider = "mysql"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -9,8 +9,8 @@ generator client {
 
 model Role {
   id          Int      @id @default(autoincrement())
-  name        String   @unique @db.VarChar(50)
-  description String?  @db.Text
+  name        String   @unique
+  description String?
   users       User[]
   createdAt   DateTime @default(now()) @map("created_at")
   
@@ -19,9 +19,9 @@ model Role {
 
 model User {
   id           Int           @id @default(autoincrement())
-  email        String        @unique @db.VarChar(100)
-  password     String        @db.VarChar(255)
-  name         String        @db.VarChar(100)
+  email        String        @unique
+  password     String
+  name         String
   roleId       Int           @map("role_id")
   role         Role          @relation(fields: [roleId], references: [id])
   status       Status        @default(active)
@@ -36,11 +36,11 @@ model Transaction {
   id          Int            @id @default(autoincrement())
   userId      Int            @map("user_id")
   user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
-  amount      Decimal        @db.Decimal(10, 2)
+  amount      Float
   type        TransactionType
-  category    String         @db.VarChar(50)
-  date        DateTime       @db.Date
-  description String?        @db.Text
+  category    String
+  date        DateTime
+  description String?
   createdAt   DateTime       @default(now()) @map("created_at")
   updatedAt   DateTime       @updatedAt @map("updated_at")
   
