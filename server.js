@@ -7,6 +7,8 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
 
 dotenv.config();
 
@@ -916,6 +918,78 @@ const userUpdateValidation = [
     body('role_id').optional().isInt(),
     body('status').optional().isIn(['active', 'inactive'])
 ];
+
+app.use(passport.initialize());
+
+passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: process.env.GOOGLE_CALLBACK_URL || 'https://finance-backend-api-74z9.onrender.com/auth/google/callback',
+    passReqToCallback: true
+  },
+  async function(req, accessToken, refreshToken, profile, done) {
+    try {
+      let user = await prisma.user.findUnique({
+        where: { email: profile.emails[0].value }
+      });
+      
+      if (!user) {
+        user = await prisma.user.create({
+          data: {
+            email: profile.emails[0].value,
+            name: profile.displayName || profile.name.givenName || 'Google User',
+            password: '',
+            roleId: 3,
+            status: 'active'
+          }
+        });
+        console.log('New Google user created:', user.email);
+      } else {
+        console.log('Existing user logged in via Google:', user.email);
+      }
+      
+      return done(null, user);
+    } catch (error) {
+      console.error('Google OAuth error:', error);
+      return done(error, null);
+    }
+  }
+));
+
+app.get('/auth/google',
+  passport.authenticate('google', { 
+    scope: ['profile', 'email'],
+    prompt: 'select_account'
+  })
+);
+
+app.get('/auth/google/callback',
+  passport.authenticate('google', { 
+    failureRedirect: `${process.env.FRONTEND_URL || 'https://finance-dashboard-ashy-six.vercel.app'}?error=google_failed`,
+    session: false
+  }),
+  function(req, res) {
+    try {
+      const token = jwt.sign(
+        { 
+          id: req.user.id, 
+          email: req.user.email,
+          name: req.user.name,
+          role: req.user.role
+        },
+        process.env.JWT_SECRET || 'your-secret-key',
+        { expiresIn: '30d' }
+      );
+      
+      const frontendUrl = process.env.FRONTEND_URL || 'https://finance-dashboard-ashy-six.vercel.app';
+      res.redirect(`${frontendUrl}?token=${token}`);
+    } catch (error) {
+      console.error('Token generation error:', error);
+      const frontendUrl = process.env.FRONTEND_URL || 'https://finance-dashboard-ashy-six.vercel.app';
+      res.redirect(`${frontendUrl}?error=token_failed`);
+    }
+  }
+);
 
 app.get('/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
