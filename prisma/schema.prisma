@@ -26,6 +26,8 @@ model User {
   role         Role          @relation(fields: [roleId], references: [id])
   status       Status        @default(active)
   transactions Transaction[]
+  settings     UserSettings?
+  auditLogs    AuditLog[]
   createdAt    DateTime      @default(now()) @map("created_at")
   updatedAt    DateTime      @updatedAt @map("updated_at")
   
@@ -45,6 +47,41 @@ model Transaction {
   updatedAt   DateTime       @updatedAt @map("updated_at")
   
   @@map("transactions")
+}
+
+model UserSettings {
+  id                Int      @id @default(autoincrement())
+  userId            Int      @unique
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  emailNotifications Boolean  @default(true)
+  pushNotifications  Boolean  @default(true)
+  weeklyReports      Boolean  @default(true)
+  monthlyReports     Boolean  @default(true)
+  theme              String   @default("dark")
+  accentColor        String   @default("cyan")
+  fontSize           String   @default("medium")
+  compactView        Boolean  @default(false)
+  twoFactorAuth      Boolean  @default(false)
+  sessionTimeout     Int      @default(30)
+  shareAnalytics     Boolean  @default(false)
+  publicProfile      Boolean  @default(false)
+  updatedAt          DateTime @updatedAt
+  createdAt          DateTime @default(now())
+  
+  @@map("user_settings")
+}
+
+model AuditLog {
+  id          Int      @id @default(autoincrement())
+  userId      Int
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action      String
+  details     String?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+  
+  @@map("audit_logs")
 }
 
 enum Status {
