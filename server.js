@@ -124,7 +124,7 @@ const authorize = (...roles) => {
         if (!roles.includes(req.user.roleName)) {
             return res.status(403).json({ 
                 success: false, 
-                message: `Role ${req.user.roleName} is not authorized` 
+                message: 'Role ' + req.user.roleName + ' is not authorized' 
             });
         }
         next();
@@ -156,7 +156,7 @@ const checkPermission = (resource, action) => {
         if (!allowedRoles.includes(req.user.roleName)) {
             return res.status(403).json({ 
                 success: false, 
-                message: `You don't have permission to ${action} ${resource}` 
+                message: 'You don\'t have permission to ' + action + ' ' + resource 
             });
         }
         next();
@@ -232,6 +232,12 @@ const register = async (req, res) => {
             }
         });
         
+        await prisma.userSettings.create({
+            data: {
+                userId: user.id
+            }
+        });
+        
         res.status(201).json({
             success: true,
             data: {
@@ -280,6 +286,16 @@ const login = async (req, res) => {
                 message: 'Account is inactive' 
             });
         }
+        
+        await prisma.auditLog.create({
+            data: {
+                userId: user.id,
+                action: 'LOGIN',
+                details: 'User logged in',
+                ipAddress: req.ip,
+                userAgent: req.headers['user-agent']
+            }
+        });
         
         res.json({
             success: true,
@@ -403,6 +419,12 @@ const createUser = async (req, res) => {
             },
             include: {
                 role: true
+            }
+        });
+        
+        await prisma.userSettings.create({
+            data: {
+                userId: user.id
             }
         });
         
@@ -536,6 +558,14 @@ const createTransaction = async (req, res) => {
             }
         });
         
+        await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action: 'CREATE_TRANSACTION',
+                details: 'Created transaction: ' + category + ' - $' + amount
+            }
+        });
+        
         res.status(201).json({ success: true, data: transaction });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -568,6 +598,14 @@ const updateTransaction = async (req, res) => {
             where: { id: parseInt(req.params.id) }
         });
         
+        await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action: 'UPDATE_TRANSACTION',
+                details: 'Updated transaction ID: ' + req.params.id
+            }
+        });
+        
         res.json({ success: true, data: updatedTransaction });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -586,6 +624,14 @@ const deleteTransaction = async (req, res) => {
         if (result.count === 0) {
             return res.status(404).json({ success: false, message: 'Transaction not found' });
         }
+        
+        await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action: 'DELETE_TRANSACTION',
+                details: 'Deleted transaction ID: ' + req.params.id
+            }
+        });
         
         res.json({ success: true, message: 'Transaction deleted successfully' });
     } catch (error) {
@@ -696,8 +742,8 @@ const getMonthlyTrends = async (req, res) => {
             where: {
                 userId: req.user.id,
                 date: {
-                    gte: new Date(`${year}-01-01`),
-                    lte: new Date(`${year}-12-31`)
+                    gte: new Date(year + '-01-01'),
+                    lte: new Date(year + '-12-31')
                 }
             },
             select: {
@@ -814,8 +860,8 @@ const getCompleteDashboard = async (req, res) => {
             where: {
                 userId: req.user.id,
                 date: {
-                    gte: new Date(`${targetYear}-01-01`),
-                    lte: new Date(`${targetYear}-12-31`)
+                    gte: new Date(targetYear + '-01-01'),
+                    lte: new Date(targetYear + '-12-31')
                 }
             },
             select: {
@@ -865,6 +911,121 @@ const getCompleteDashboard = async (req, res) => {
                 recent_transactions: recentTransactions
             }
         });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const getSettings = async (req, res) => {
+    try {
+        let settings = await prisma.userSettings.findUnique({
+            where: { userId: req.user.id }
+        });
+        
+        if (!settings) {
+            settings = await prisma.userSettings.create({
+                data: {
+                    userId: req.user.id
+                }
+            });
+        }
+        
+        res.json({ success: true, data: settings });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const updateSettings = async (req, res) => {
+    try {
+        const {
+            emailNotifications,
+            pushNotifications,
+            weeklyReports,
+            monthlyReports,
+            theme,
+            accentColor,
+            fontSize,
+            compactView,
+            twoFactorAuth,
+            sessionTimeout,
+            shareAnalytics,
+            publicProfile
+        } = req.body;
+        
+        const settings = await prisma.userSettings.upsert({
+            where: { userId: req.user.id },
+            update: {
+                emailNotifications: emailNotifications !== undefined ? emailNotifications : true,
+                pushNotifications: pushNotifications !== undefined ? pushNotifications : true,
+                weeklyReports: weeklyReports !== undefined ? weeklyReports : true,
+                monthlyReports: monthlyReports !== undefined ? monthlyReports : true,
+                theme: theme || 'dark',
+                accentColor: accentColor || 'cyan',
+                fontSize: fontSize || 'medium',
+                compactView: compactView !== undefined ? compactView : false,
+                twoFactorAuth: twoFactorAuth !== undefined ? twoFactorAuth : false,
+                sessionTimeout: sessionTimeout || 30,
+                shareAnalytics: shareAnalytics !== undefined ? shareAnalytics : false,
+                publicProfile: publicProfile !== undefined ? publicProfile : false
+            },
+            create: {
+                userId: req.user.id,
+                emailNotifications: emailNotifications !== undefined ? emailNotifications : true,
+                pushNotifications: pushNotifications !== undefined ? pushNotifications : true,
+                weeklyReports: weeklyReports !== undefined ? weeklyReports : true,
+                monthlyReports: monthlyReports !== undefined ? monthlyReports : true,
+                theme: theme || 'dark',
+                accentColor: accentColor || 'cyan',
+                fontSize: fontSize || 'medium',
+                compactView: compactView !== undefined ? compactView : false,
+                twoFactorAuth: twoFactorAuth !== undefined ? twoFactorAuth : false,
+                sessionTimeout: sessionTimeout || 30,
+                shareAnalytics: shareAnalytics !== undefined ? shareAnalytics : false,
+                publicProfile: publicProfile !== undefined ? publicProfile : false
+            }
+        });
+        
+        await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action: 'UPDATE_SETTINGS',
+                details: 'User updated their settings'
+            }
+        });
+        
+        res.json({ success: true, data: settings });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const getAuditLogs = async (req, res) => {
+    try {
+        const logs = await prisma.auditLog.findMany({
+            where: { userId: req.user.id },
+            orderBy: { createdAt: 'desc' },
+            take: 50
+        });
+        res.json({ success: true, data: logs });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const createAuditLog = async (req, res) => {
+    try {
+        const { action, details } = req.body;
+        const log = await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action,
+                details,
+                ipAddress: req.ip,
+                userAgent: req.headers['user-agent']
+            }
+        });
+        res.json({ success: true, data: log });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -943,6 +1104,13 @@ passport.use(new GoogleStrategy({
             status: 'active'
           }
         });
+        
+        await prisma.userSettings.create({
+          data: {
+            userId: user.id
+          }
+        });
+        
         console.log('New Google user created:', user.email);
       } else {
         console.log('Existing user logged in via Google:', user.email);
@@ -965,7 +1133,7 @@ app.get('/auth/google',
 
 app.get('/auth/google/callback',
   passport.authenticate('google', { 
-    failureRedirect: `${process.env.FRONTEND_URL || 'https://finance-dashboard-ashy-six.vercel.app'}?error=google_failed`,
+    failureRedirect: process.env.FRONTEND_URL + '?error=google_failed' || 'https://finance-dashboard-ashy-six.vercel.app?error=google_failed',
     session: false
   }),
   function(req, res) {
@@ -982,11 +1150,11 @@ app.get('/auth/google/callback',
       );
       
       const frontendUrl = process.env.FRONTEND_URL || 'https://finance-dashboard-ashy-six.vercel.app';
-      res.redirect(`${frontendUrl}?token=${token}`);
+      res.redirect(frontendUrl + '?token=' + token);
     } catch (error) {
       console.error('Token generation error:', error);
       const frontendUrl = process.env.FRONTEND_URL || 'https://finance-dashboard-ashy-six.vercel.app';
-      res.redirect(`${frontendUrl}?error=token_failed`);
+      res.redirect(frontendUrl + '?error=token_failed');
     }
   }
 );
@@ -1019,20 +1187,25 @@ app.get('/api/dashboard/monthly-trends', protect, checkPermission('dashboard', '
 app.get('/api/dashboard/recent-activity', protect, checkPermission('dashboard', 'read'), getRecentActivity);
 app.get('/api/dashboard/complete', protect, checkPermission('dashboard', 'read'), getCompleteDashboard);
 
+app.get('/api/settings', protect, getSettings);
+app.put('/api/settings', protect, updateSettings);
+app.get('/api/audit-logs', protect, getAuditLogs);
+app.post('/api/audit-log', protect, createAuditLog);
+
 app.use(errorHandler);
 
 async function startServer() {
     try {
         await initializeDatabase();
         app.listen(PORT, () => {
-            console.log(`\n=================================`);
-            console.log(`🚀 Server running on port ${PORT}`);
-            console.log(`📍 API URL: http://localhost:${PORT}`);
-            console.log(`=================================`);
-            console.log(`\n📝 Test Credentials:`);
-            console.log(`   Email: admin@finance.com`);
-            console.log(`   Password: Admin@123`);
-            console.log(`=================================\n`);
+            console.log('\n=================================');
+            console.log('🚀 Server running on port ' + PORT);
+            console.log('📍 API URL: http://localhost:' + PORT);
+            console.log('=================================');
+            console.log('\n📝 Test Credentials:');
+            console.log('   Email: admin@finance.com');
+            console.log('   Password: Admin@123');
+            console.log('=================================\n');
         });
     } catch (error) {
         console.error('Failed to start server:', error);
