@@ -25,6 +25,8 @@ model User {
   roleId       Int           @map("role_id")
   role         Role          @relation(fields: [roleId], references: [id])
   status       Status        @default(active)
+  subscription Subscription?
+  accounts     Account[]
   transactions Transaction[]
   settings     UserSettings?
   auditLogs    AuditLog[]
@@ -32,6 +34,37 @@ model User {
   updatedAt    DateTime      @updatedAt @map("updated_at")
   
   @@map("users")
+}
+
+model Account {
+  id          Int      @id @default(autoincrement())
+  userId      Int      @map("user_id")
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  type        String
+  balance     Float    @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  
+  @@map("accounts")
+}
+
+model Subscription {
+  id          Int      @id @default(autoincrement())
+  userId      Int      @unique @map("user_id")
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan        PlanType @default(free)
+  status      SubStatus @default(active)
+  startDate   DateTime @default(now())
+  endDate     DateTime
+  paymentId   String?
+  amount      Float?
+  currency    String   @default("USD")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  
+  @@map("subscriptions")
 }
 
 model Transaction {
@@ -87,6 +120,20 @@ model AuditLog {
 enum Status {
   active
   inactive
+}
+
+enum PlanType {
+  free
+  basic
+  premium
+  enterprise
+}
+
+enum SubStatus {
+  active
+  expired
+  cancelled
+  pending
 }
 
 enum TransactionType {
