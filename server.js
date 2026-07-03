@@ -9,10 +9,46 @@ const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const validator = require('validator');
 
 dotenv.config();
 
 const prisma = new PrismaClient();
+
+const validatePassword = (password) => {
+  const errors = [];
+  
+  if (password.length < 8) {
+    errors.push('Password must be at least 8 characters long');
+  }
+  
+  if (!/[A-Z]/.test(password)) {
+    errors.push('Password must contain at least one uppercase letter');
+  }
+  
+  if (!/[a-z]/.test(password)) {
+    errors.push('Password must contain at least one lowercase letter');
+  }
+  
+  if (!/[0-9]/.test(password)) {
+    errors.push('Password must contain at least one number');
+  }
+  
+  if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password)) {
+    errors.push('Password must contain at least one special character (!@#$%^&*)');
+  }
+  
+  const weakPasswords = [
+    'password', 'password123', '12345678', 'qwerty123', 
+    'admin123', 'letmein', 'welcome123', 'password1',
+    '123456789', 'qwertyuiop', '1234567890'
+  ];
+  if (weakPasswords.includes(password.toLowerCase())) {
+    errors.push('Password is too common. Please choose a stronger password');
+  }
+  
+  return errors;
+};
 
 async function initializeDatabase() {
     try {
@@ -35,7 +71,7 @@ async function initializeDatabase() {
         
         if (!adminExists) {
             const hashedPassword = await bcrypt.hash('Admin@123', 10);
-            await prisma.user.create({
+            const admin = await prisma.user.create({
                 data: {
                     email: 'admin@finance.com',
                     password: hashedPassword,
@@ -44,6 +80,17 @@ async function initializeDatabase() {
                     status: 'active'
                 }
             });
+            
+            await prisma.subscription.create({
+                data: {
+                    userId: admin.id,
+                    plan: 'enterprise',
+                    status: 'active',
+                    endDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+                    amount: 0
+                }
+            });
+            
             console.log('Admin user created');
         }
         
@@ -84,7 +131,8 @@ const protect = async (req, res, next) => {
         const user = await prisma.user.findUnique({
             where: { id: decoded.id },
             include: {
-                role: true
+                role: true,
+                subscription: true
             }
         });
         
@@ -108,7 +156,8 @@ const protect = async (req, res, next) => {
             name: user.name,
             roleId: user.roleId,
             roleName: user.role.name,
-            status: user.status
+            status: user.status,
+            subscription: user.subscription
         };
         next();
     } catch (error) {
@@ -117,6 +166,60 @@ const protect = async (req, res, next) => {
             message: 'Not authorized' 
         });
     }
+};
+
+const requireSubscription = (requiredPlan) => {
+    return async (req, res, next) => {
+        try {
+            const user = await prisma.user.findUnique({
+                where: { id: req.user.id },
+                include: { subscription: true }
+            });
+            
+            if (!user.subscription) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'No active subscription found. Please subscribe to access this feature.'
+                });
+            }
+            
+            if (user.subscription.status !== 'active') {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Your subscription is ' + user.subscription.status + '. Please renew to access this feature.'
+                });
+            }
+            
+            if (new Date(user.subscription.endDate) < new Date()) {
+                await prisma.subscription.update({
+                    where: { userId: user.id },
+                    data: { status: 'expired' }
+                });
+                return res.status(403).json({
+                    success: false,
+                    message: 'Your subscription has expired. Please renew to continue.'
+                });
+            }
+            
+            const planLevels = {
+                free: 0,
+                basic: 1,
+                premium: 2,
+                enterprise: 3
+            };
+            
+            if (planLevels[user.subscription.plan] < planLevels[requiredPlan]) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Your current plan (' + user.subscription.plan + ') does not have access to this feature. Please upgrade to ' + requiredPlan + '.'
+                });
+            }
+            
+            next();
+        } catch (error) {
+            res.status(500).json({ success: false, message: error.message });
+        }
+    };
 };
 
 const authorize = (...roles) => {
@@ -147,6 +250,12 @@ const checkPermission = (resource, action) => {
         },
         dashboard: {
             read: ['admin', 'analyst', 'viewer']
+        },
+        account: {
+            create: ['admin', 'analyst'],
+            read: ['admin', 'analyst', 'viewer'],
+            update: ['admin', 'analyst'],
+            delete: ['admin']
         }
     };
     
@@ -192,9 +301,26 @@ const generateToken = (id) => {
     });
 };
 
+// ===== REGISTER - Only paid users can register =====
 const register = async (req, res) => {
     try {
-        const { email, password, name, role_id = 3 } = req.body;
+        const { email, password, name, role_id = 3, paymentId, plan = 'basic' } = req.body;
+        
+        if (!validator.isEmail(email)) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Please provide a valid email address' 
+            });
+        }
+        
+        const passwordErrors = validatePassword(password);
+        if (passwordErrors.length > 0) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Password validation failed',
+                errors: passwordErrors 
+            });
+        }
         
         const existingUser = await prisma.user.findUnique({
             where: { email }
@@ -207,8 +333,25 @@ const register = async (req, res) => {
             });
         }
         
+        const roleId = parseInt(role_id);
+        if (roleId === 1) {
+            return res.status(403).json({ 
+                success: false, 
+                message: 'You cannot register as an admin. Admin accounts are created by system administrators only.' 
+            });
+        }
+        
+        // CHECK: User must have valid payment/subscription
+        if (!paymentId) {
+            return res.status(402).json({
+                success: false,
+                message: 'Payment required. Please subscribe to create an account.',
+                code: 'PAYMENT_REQUIRED'
+            });
+        }
+        
         const role = await prisma.role.findUnique({
-            where: { id: role_id }
+            where: { id: roleId }
         });
         
         if (!role) {
@@ -224,11 +367,30 @@ const register = async (req, res) => {
                 email,
                 password: hashedPassword,
                 name,
-                roleId: role_id,
+                roleId: roleId,
                 status: 'active'
             },
             include: {
                 role: true
+            }
+        });
+        
+        // Create subscription for paid user
+        const planPrices = {
+            basic: 9.99,
+            premium: 29.99,
+            enterprise: 99.99
+        };
+        
+        await prisma.subscription.create({
+            data: {
+                userId: user.id,
+                plan: plan || 'basic',
+                status: 'active',
+                endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+                paymentId: paymentId,
+                amount: planPrices[plan] || 9.99,
+                currency: 'USD'
             }
         });
         
@@ -238,13 +400,25 @@ const register = async (req, res) => {
             }
         });
         
+        await prisma.auditLog.create({
+            data: {
+                userId: user.id,
+                action: 'REGISTER',
+                details: 'New user registered with ' + plan + ' plan: ' + email,
+                ipAddress: req.ip,
+                userAgent: req.headers['user-agent']
+            }
+        });
+        
         res.status(201).json({
             success: true,
+            message: 'Account created successfully with ' + plan + ' plan!',
             data: {
                 id: user.id,
                 email: user.email,
                 name: user.name,
                 role: user.role.name,
+                plan: plan,
                 token: generateToken(user.id)
             }
         });
@@ -260,7 +434,8 @@ const login = async (req, res) => {
         const user = await prisma.user.findUnique({
             where: { email },
             include: {
-                role: true
+                role: true,
+                subscription: true
             }
         });
         
@@ -268,6 +443,42 @@ const login = async (req, res) => {
             return res.status(401).json({ 
                 success: false, 
                 message: 'Invalid credentials' 
+            });
+        }
+        
+        if (user.role.name === 'admin') {
+            return res.status(403).json({ 
+                success: false, 
+                message: 'Admin accounts cannot be accessed through this login. Please use the admin portal.' 
+            });
+        }
+        
+        // Check if user has active subscription
+        if (user.subscription) {
+            if (user.subscription.status !== 'active') {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Your subscription is ' + user.subscription.status + '. Please renew to continue.',
+                    subscriptionStatus: user.subscription.status
+                });
+            }
+            
+            if (new Date(user.subscription.endDate) < new Date()) {
+                await prisma.subscription.update({
+                    where: { userId: user.id },
+                    data: { status: 'expired' }
+                });
+                return res.status(403).json({
+                    success: false,
+                    message: 'Your subscription has expired. Please renew to continue.',
+                    subscriptionStatus: 'expired'
+                });
+            }
+        } else {
+            return res.status(403).json({
+                success: false,
+                message: 'No active subscription found. Please subscribe to continue.',
+                subscriptionStatus: 'none'
             });
         }
         
@@ -304,6 +515,11 @@ const login = async (req, res) => {
                 email: user.email,
                 name: user.name,
                 role: user.role.name,
+                subscription: {
+                    plan: user.subscription.plan,
+                    status: user.subscription.status,
+                    endDate: user.subscription.endDate
+                },
                 token: generateToken(user.id)
             }
         });
@@ -312,6 +528,203 @@ const login = async (req, res) => {
     }
 };
 
+// ===== GET SUBSCRIPTION INFO =====
+const getSubscription = async (req, res) => {
+    try {
+        const subscription = await prisma.subscription.findUnique({
+            where: { userId: req.user.id }
+        });
+        
+        if (!subscription) {
+            return res.status(404).json({
+                success: false,
+                message: 'No subscription found'
+            });
+        }
+        
+        res.json({
+            success: true,
+            data: subscription
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// ===== RENEW SUBSCRIPTION =====
+const renewSubscription = async (req, res) => {
+    try {
+        const { paymentId, plan } = req.body;
+        
+        const subscription = await prisma.subscription.findUnique({
+            where: { userId: req.user.id }
+        });
+        
+        if (!subscription) {
+            return res.status(404).json({
+                success: false,
+                message: 'No subscription found'
+            });
+        }
+        
+        const planPrices = {
+            basic: 9.99,
+            premium: 29.99,
+            enterprise: 99.99
+        };
+        
+        const updatedSubscription = await prisma.subscription.update({
+            where: { userId: req.user.id },
+            data: {
+                plan: plan || subscription.plan,
+                status: 'active',
+                endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+                paymentId: paymentId || subscription.paymentId,
+                amount: planPrices[plan] || subscription.amount
+            }
+        });
+        
+        await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action: 'RENEW_SUBSCRIPTION',
+                details: 'Renewed subscription to ' + (plan || subscription.plan) + ' plan'
+            }
+        });
+        
+        res.json({
+            success: true,
+            message: 'Subscription renewed successfully!',
+            data: updatedSubscription
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// ===== ACCOUNT CRUD OPERATIONS =====
+const getAccounts = async (req, res) => {
+    try {
+        const accounts = await prisma.account.findMany({
+            where: { 
+                userId: req.user.id,
+                isActive: true
+            }
+        });
+        res.json({ success: true, data: accounts });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const getAccount = async (req, res) => {
+    try {
+        const account = await prisma.account.findFirst({
+            where: {
+                id: parseInt(req.params.id),
+                userId: req.user.id
+            }
+        });
+        
+        if (!account) {
+            return res.status(404).json({ success: false, message: 'Account not found' });
+        }
+        
+        res.json({ success: true, data: account });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const createAccount = async (req, res) => {
+    try {
+        const { name, type, balance = 0 } = req.body;
+        
+        const account = await prisma.account.create({
+            data: {
+                userId: req.user.id,
+                name,
+                type,
+                balance: parseFloat(balance)
+            }
+        });
+        
+        await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action: 'CREATE_ACCOUNT',
+                details: 'Created account: ' + name + ' (' + type + ')'
+            }
+        });
+        
+        res.status(201).json({ success: true, data: account });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const updateAccount = async (req, res) => {
+    try {
+        const { name, type, balance, isActive } = req.body;
+        
+        const account = await prisma.account.update({
+            where: {
+                id: parseInt(req.params.id)
+            },
+            data: {
+                ...(name && { name }),
+                ...(type && { type }),
+                ...(balance !== undefined && { balance: parseFloat(balance) }),
+                ...(isActive !== undefined && { isActive })
+            }
+        });
+        
+        await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action: 'UPDATE_ACCOUNT',
+                details: 'Updated account: ' + account.name
+            }
+        });
+        
+        res.json({ success: true, data: account });
+    } catch (error) {
+        if (error.code === 'P2025') {
+            return res.status(404).json({ success: false, message: 'Account not found' });
+        }
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const deleteAccount = async (req, res) => {
+    try {
+        await prisma.account.update({
+            where: {
+                id: parseInt(req.params.id)
+            },
+            data: {
+                isActive: false
+            }
+        });
+        
+        await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action: 'DELETE_ACCOUNT',
+                details: 'Deleted account ID: ' + req.params.id
+            }
+        });
+        
+        res.json({ success: true, message: 'Account deleted successfully' });
+    } catch (error) {
+        if (error.code === 'P2025') {
+            return res.status(404).json({ success: false, message: 'Account not found' });
+        }
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// ===== OTHER ROUTES (GET USERS, TRANSACTIONS, ETC.) =====
 const getUsers = async (req, res) => {
     try {
         const { status, role_id } = req.query;
@@ -333,6 +746,13 @@ const getUsers = async (req, res) => {
                         name: true
                     }
                 },
+                subscription: {
+                    select: {
+                        plan: true,
+                        status: true,
+                        endDate: true
+                    }
+                },
                 createdAt: true
             },
             orderBy: {
@@ -347,6 +767,7 @@ const getUsers = async (req, res) => {
             status: user.status,
             role_id: user.roleId,
             role_name: user.role.name,
+            subscription: user.subscription,
             created_at: user.createdAt
         }));
         
@@ -371,6 +792,13 @@ const getUser = async (req, res) => {
                         name: true
                     }
                 },
+                subscription: {
+                    select: {
+                        plan: true,
+                        status: true,
+                        endDate: true
+                    }
+                },
                 createdAt: true
             }
         });
@@ -388,6 +816,7 @@ const getUser = async (req, res) => {
                 status: user.status,
                 role_id: user.roleId,
                 role_name: user.role.name,
+                subscription: user.subscription,
                 created_at: user.createdAt
             }
         });
@@ -399,6 +828,22 @@ const getUser = async (req, res) => {
 const createUser = async (req, res) => {
     try {
         const { email, password, name, role_id } = req.body;
+        
+        if (!validator.isEmail(email)) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Please provide a valid email address' 
+            });
+        }
+        
+        const passwordErrors = validatePassword(password);
+        if (passwordErrors.length > 0) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Password validation failed',
+                errors: passwordErrors 
+            });
+        }
         
         const existingUser = await prisma.user.findUnique({
             where: { email }
@@ -425,6 +870,17 @@ const createUser = async (req, res) => {
         await prisma.userSettings.create({
             data: {
                 userId: user.id
+            }
+        });
+        
+        // Create free subscription for admin-created users
+        await prisma.subscription.create({
+            data: {
+                userId: user.id,
+                plan: 'free',
+                status: 'active',
+                endDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+                amount: 0
             }
         });
         
@@ -493,6 +949,7 @@ const deleteUser = async (req, res) => {
     }
 };
 
+// ===== TRANSACTION ROUTES =====
 const getTransactions = async (req, res) => {
     try {
         const { type, category, startDate, endDate, limit, offset } = req.query;
@@ -545,7 +1002,7 @@ const getTransaction = async (req, res) => {
 
 const createTransaction = async (req, res) => {
     try {
-        const { amount, type, category, date, description } = req.body;
+        const { amount, type, category, date, description, accountId } = req.body;
         
         const transaction = await prisma.transaction.create({
             data: {
@@ -557,6 +1014,27 @@ const createTransaction = async (req, res) => {
                 description
             }
         });
+        
+        // Update account balance
+        if (accountId) {
+            const account = await prisma.account.findFirst({
+                where: {
+                    id: parseInt(accountId),
+                    userId: req.user.id
+                }
+            });
+            
+            if (account) {
+                const newBalance = type === 'income' 
+                    ? account.balance + parseFloat(amount)
+                    : account.balance - parseFloat(amount);
+                    
+                await prisma.account.update({
+                    where: { id: parseInt(accountId) },
+                    data: { balance: newBalance }
+                });
+            }
+        }
         
         await prisma.auditLog.create({
             data: {
@@ -639,6 +1117,7 @@ const deleteTransaction = async (req, res) => {
     }
 };
 
+// ===== DASHBOARD ROUTES =====
 const getDashboardSummary = async (req, res) => {
     try {
         const { startDate, endDate } = req.query;
@@ -897,6 +1376,13 @@ const getCompleteDashboard = async (req, res) => {
             take: 10
         });
         
+        const accounts = await prisma.account.findMany({
+            where: {
+                userId: req.user.id,
+                isActive: true
+            }
+        });
+        
         res.json({
             success: true,
             data: {
@@ -908,7 +1394,8 @@ const getCompleteDashboard = async (req, res) => {
                 },
                 category_breakdown: Array.from(categoryMap.values()),
                 monthly_trends: monthlyData,
-                recent_transactions: recentTransactions
+                recent_transactions: recentTransactions,
+                accounts: accounts
             }
         });
     } catch (error) {
@@ -916,6 +1403,7 @@ const getCompleteDashboard = async (req, res) => {
     }
 };
 
+// ===== SETTINGS ROUTES =====
 const getSettings = async (req, res) => {
     try {
         let settings = await prisma.userSettings.findUnique({
@@ -1048,9 +1536,11 @@ app.use('/api/', limiter);
 
 const registerValidation = [
     body('email').isEmail().normalizeEmail(),
-    body('password').isLength({ min: 6 }),
+    body('password').isLength({ min: 8 }),
     body('name').notEmpty().trim(),
-    body('role_id').optional().isInt()
+    body('role_id').optional().isInt(),
+    body('paymentId').optional().isString(),
+    body('plan').optional().isIn(['basic', 'premium', 'enterprise'])
 ];
 
 const loginValidation = [
@@ -1063,7 +1553,8 @@ const transactionCreateValidation = [
     body('type').isIn(['income', 'expense']),
     body('category').notEmpty().trim(),
     body('date').isISO8601().toDate(),
-    body('description').optional().trim()
+    body('description').optional().trim(),
+    body('accountId').optional().isInt()
 ];
 
 const transactionUpdateValidation = [
@@ -1078,6 +1569,19 @@ const userUpdateValidation = [
     body('name').optional().trim(),
     body('role_id').optional().isInt(),
     body('status').optional().isIn(['active', 'inactive'])
+];
+
+const accountCreateValidation = [
+    body('name').notEmpty().trim(),
+    body('type').notEmpty().trim(),
+    body('balance').optional().isFloat({ min: 0 })
+];
+
+const accountUpdateValidation = [
+    body('name').optional().trim(),
+    body('type').optional().trim(),
+    body('balance').optional().isFloat({ min: 0 }),
+    body('isActive').optional().isBoolean()
 ];
 
 app.use(passport.initialize());
@@ -1108,6 +1612,16 @@ passport.use(new GoogleStrategy({
         await prisma.userSettings.create({
           data: {
             userId: user.id
+          }
+        });
+        
+        await prisma.subscription.create({
+          data: {
+            userId: user.id,
+            plan: 'free',
+            status: 'active',
+            endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+            amount: 0
           }
         });
         
@@ -1163,30 +1677,46 @@ app.get('/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
+// ===== AUTH ROUTES =====
 app.post('/api/auth/register', registerValidation, validateRequest, register);
 app.post('/api/auth/login', loginValidation, validateRequest, login);
 app.get('/api/auth/me', protect, async (req, res) => {
     res.json({ success: true, data: req.user });
 });
 
+// ===== SUBSCRIPTION ROUTES =====
+app.get('/api/subscription', protect, getSubscription);
+app.post('/api/subscription/renew', protect, renewSubscription);
+
+// ===== USER ROUTES =====
 app.get('/api/users', protect, authorize('admin'), getUsers);
 app.get('/api/users/:id', protect, authorize('admin'), getUser);
 app.post('/api/users', protect, authorize('admin'), registerValidation, validateRequest, createUser);
 app.put('/api/users/:id', protect, authorize('admin'), userUpdateValidation, validateRequest, updateUser);
 app.delete('/api/users/:id', protect, authorize('admin'), deleteUser);
 
-app.get('/api/transactions', protect, checkPermission('transaction', 'read'), getTransactions);
-app.get('/api/transactions/:id', protect, checkPermission('transaction', 'read'), getTransaction);
-app.post('/api/transactions', protect, checkPermission('transaction', 'create'), transactionCreateValidation, validateRequest, createTransaction);
-app.put('/api/transactions/:id', protect, checkPermission('transaction', 'update'), transactionUpdateValidation, validateRequest, updateTransaction);
-app.delete('/api/transactions/:id', protect, checkPermission('transaction', 'delete'), deleteTransaction);
+// ===== ACCOUNT ROUTES (Requires subscription) =====
+app.get('/api/accounts', protect, requireSubscription('basic'), getAccounts);
+app.get('/api/accounts/:id', protect, requireSubscription('basic'), getAccount);
+app.post('/api/accounts', protect, requireSubscription('basic'), accountCreateValidation, validateRequest, createAccount);
+app.put('/api/accounts/:id', protect, requireSubscription('basic'), accountUpdateValidation, validateRequest, updateAccount);
+app.delete('/api/accounts/:id', protect, requireSubscription('basic'), deleteAccount);
 
-app.get('/api/dashboard/summary', protect, checkPermission('dashboard', 'read'), getDashboardSummary);
-app.get('/api/dashboard/category-totals', protect, checkPermission('dashboard', 'read'), getCategoryWiseTotals);
-app.get('/api/dashboard/monthly-trends', protect, checkPermission('dashboard', 'read'), getMonthlyTrends);
-app.get('/api/dashboard/recent-activity', protect, checkPermission('dashboard', 'read'), getRecentActivity);
-app.get('/api/dashboard/complete', protect, checkPermission('dashboard', 'read'), getCompleteDashboard);
+// ===== TRANSACTION ROUTES =====
+app.get('/api/transactions', protect, requireSubscription('basic'), checkPermission('transaction', 'read'), getTransactions);
+app.get('/api/transactions/:id', protect, requireSubscription('basic'), checkPermission('transaction', 'read'), getTransaction);
+app.post('/api/transactions', protect, requireSubscription('basic'), checkPermission('transaction', 'create'), transactionCreateValidation, validateRequest, createTransaction);
+app.put('/api/transactions/:id', protect, requireSubscription('basic'), checkPermission('transaction', 'update'), transactionUpdateValidation, validateRequest, updateTransaction);
+app.delete('/api/transactions/:id', protect, requireSubscription('basic'), checkPermission('transaction', 'delete'), deleteTransaction);
 
+// ===== DASHBOARD ROUTES =====
+app.get('/api/dashboard/summary', protect, requireSubscription('basic'), checkPermission('dashboard', 'read'), getDashboardSummary);
+app.get('/api/dashboard/category-totals', protect, requireSubscription('basic'), checkPermission('dashboard', 'read'), getCategoryWiseTotals);
+app.get('/api/dashboard/monthly-trends', protect, requireSubscription('basic'), checkPermission('dashboard', 'read'), getMonthlyTrends);
+app.get('/api/dashboard/recent-activity', protect, requireSubscription('basic'), checkPermission('dashboard', 'read'), getRecentActivity);
+app.get('/api/dashboard/complete', protect, requireSubscription('basic'), checkPermission('dashboard', 'read'), getCompleteDashboard);
+
+// ===== SETTINGS ROUTES =====
 app.get('/api/settings', protect, getSettings);
 app.put('/api/settings', protect, updateSettings);
 app.get('/api/audit-logs', protect, getAuditLogs);
