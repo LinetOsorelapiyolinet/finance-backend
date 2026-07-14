@@ -301,10 +301,10 @@ const generateToken = (id) => {
     });
 };
 
-// ===== REGISTER - Only paid users can register =====
+// ===== REGISTER - NOW ALLOWS FREE SIGNUP =====
 const register = async (req, res) => {
     try {
-        const { email, password, name, role_id = 3, paymentId, plan = 'basic' } = req.body;
+        const { email, password, name, role_id = 3 } = req.body;
         
         if (!validator.isEmail(email)) {
             return res.status(400).json({ 
@@ -337,16 +337,7 @@ const register = async (req, res) => {
         if (roleId === 1) {
             return res.status(403).json({ 
                 success: false, 
-                message: 'You cannot register as an admin. Admin accounts are created by system administrators only.' 
-            });
-        }
-        
-        // CHECK: User must have valid payment/subscription
-        if (!paymentId) {
-            return res.status(402).json({
-                success: false,
-                message: 'Payment required. Please subscribe to create an account.',
-                code: 'PAYMENT_REQUIRED'
+                message: 'You cannot register as an admin.' 
             });
         }
         
@@ -375,22 +366,13 @@ const register = async (req, res) => {
             }
         });
         
-        // Create subscription for paid user
-        const planPrices = {
-            basic: 9.99,
-            premium: 29.99,
-            enterprise: 99.99
-        };
-        
         await prisma.subscription.create({
             data: {
                 userId: user.id,
-                plan: plan || 'basic',
+                plan: 'free',
                 status: 'active',
-                endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-                paymentId: paymentId,
-                amount: planPrices[plan] || 9.99,
-                currency: 'USD'
+                endDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+                amount: 0
             }
         });
         
@@ -404,7 +386,7 @@ const register = async (req, res) => {
             data: {
                 userId: user.id,
                 action: 'REGISTER',
-                details: 'New user registered with ' + plan + ' plan: ' + email,
+                details: 'New user registered: ' + email,
                 ipAddress: req.ip,
                 userAgent: req.headers['user-agent']
             }
@@ -412,13 +394,11 @@ const register = async (req, res) => {
         
         res.status(201).json({
             success: true,
-            message: 'Account created successfully with ' + plan + ' plan!',
             data: {
                 id: user.id,
                 email: user.email,
                 name: user.name,
                 role: user.role.name,
-                plan: plan,
                 token: generateToken(user.id)
             }
         });
@@ -427,6 +407,7 @@ const register = async (req, res) => {
     }
 };
 
+// ===== LOGIN - ALLOWS ADMIN & NON-SUBSCRIBERS =====
 const login = async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -446,42 +427,6 @@ const login = async (req, res) => {
             });
         }
         
-        if (user.role.name === 'admin') {
-            return res.status(403).json({ 
-                success: false, 
-                message: 'Admin accounts cannot be accessed through this login. Please use the admin portal.' 
-            });
-        }
-        
-        // Check if user has active subscription
-        if (user.subscription) {
-            if (user.subscription.status !== 'active') {
-                return res.status(403).json({
-                    success: false,
-                    message: 'Your subscription is ' + user.subscription.status + '. Please renew to continue.',
-                    subscriptionStatus: user.subscription.status
-                });
-            }
-            
-            if (new Date(user.subscription.endDate) < new Date()) {
-                await prisma.subscription.update({
-                    where: { userId: user.id },
-                    data: { status: 'expired' }
-                });
-                return res.status(403).json({
-                    success: false,
-                    message: 'Your subscription has expired. Please renew to continue.',
-                    subscriptionStatus: 'expired'
-                });
-            }
-        } else {
-            return res.status(403).json({
-                success: false,
-                message: 'No active subscription found. Please subscribe to continue.',
-                subscriptionStatus: 'none'
-            });
-        }
-        
         const isPasswordValid = await bcrypt.compare(password, user.password);
         
         if (!isPasswordValid) {
@@ -496,6 +441,18 @@ const login = async (req, res) => {
                 success: false, 
                 message: 'Account is inactive' 
             });
+        }
+        
+        let subscriptionStatus = 'none';
+        if (user.subscription) {
+            subscriptionStatus = user.subscription.status;
+            if (new Date(user.subscription.endDate) < new Date()) {
+                await prisma.subscription.update({
+                    where: { userId: user.id },
+                    data: { status: 'expired' }
+                });
+                subscriptionStatus = 'expired';
+            }
         }
         
         await prisma.auditLog.create({
@@ -515,11 +472,11 @@ const login = async (req, res) => {
                 email: user.email,
                 name: user.name,
                 role: user.role.name,
-                subscription: {
+                subscription: user.subscription ? {
                     plan: user.subscription.plan,
-                    status: user.subscription.status,
+                    status: subscriptionStatus,
                     endDate: user.subscription.endDate
-                },
+                } : null,
                 token: generateToken(user.id)
             }
         });
@@ -873,7 +830,6 @@ const createUser = async (req, res) => {
             }
         });
         
-        // Create free subscription for admin-created users
         await prisma.subscription.create({
             data: {
                 userId: user.id,
@@ -1015,7 +971,6 @@ const createTransaction = async (req, res) => {
             }
         });
         
-        // Update account balance
         if (accountId) {
             const account = await prisma.account.findFirst({
                 where: {
@@ -1519,6 +1474,10 @@ const createAuditLog = async (req, res) => {
     }
 };
 
+// ==============================================
+// APP SETUP
+// ==============================================
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -1538,9 +1497,7 @@ const registerValidation = [
     body('email').isEmail().normalizeEmail(),
     body('password').isLength({ min: 8 }),
     body('name').notEmpty().trim(),
-    body('role_id').optional().isInt(),
-    body('paymentId').optional().isString(),
-    body('plan').optional().isIn(['basic', 'premium', 'enterprise'])
+    body('role_id').optional().isInt()
 ];
 
 const loginValidation = [
@@ -1620,7 +1577,7 @@ passport.use(new GoogleStrategy({
             userId: user.id,
             plan: 'free',
             status: 'active',
-            endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+            endDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
             amount: 0
           }
         });
@@ -1677,46 +1634,251 @@ app.get('/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-// ===== AUTH ROUTES =====
+// ==============================================
+// AUTH ROUTES
+// ==============================================
 app.post('/api/auth/register', registerValidation, validateRequest, register);
 app.post('/api/auth/login', loginValidation, validateRequest, login);
 app.get('/api/auth/me', protect, async (req, res) => {
     res.json({ success: true, data: req.user });
 });
 
-// ===== SUBSCRIPTION ROUTES =====
+// ==============================================
+// SUBSCRIPTION ROUTES
+// ==============================================
 app.get('/api/subscription', protect, getSubscription);
 app.post('/api/subscription/renew', protect, renewSubscription);
 
-// ===== USER ROUTES =====
+// ==============================================
+// USER ROUTES
+// ==============================================
 app.get('/api/users', protect, authorize('admin'), getUsers);
 app.get('/api/users/:id', protect, authorize('admin'), getUser);
 app.post('/api/users', protect, authorize('admin'), registerValidation, validateRequest, createUser);
 app.put('/api/users/:id', protect, authorize('admin'), userUpdateValidation, validateRequest, updateUser);
 app.delete('/api/users/:id', protect, authorize('admin'), deleteUser);
 
-// ===== ACCOUNT ROUTES (Requires subscription) =====
-app.get('/api/accounts', protect, requireSubscription('basic'), getAccounts);
-app.get('/api/accounts/:id', protect, requireSubscription('basic'), getAccount);
-app.post('/api/accounts', protect, requireSubscription('basic'), accountCreateValidation, validateRequest, createAccount);
-app.put('/api/accounts/:id', protect, requireSubscription('basic'), accountUpdateValidation, validateRequest, updateAccount);
-app.delete('/api/accounts/:id', protect, requireSubscription('basic'), deleteAccount);
+// ==============================================
+// ADMIN PORTAL ROUTES
+// ==============================================
+app.post('/api/auth/admin-login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        
+        const user = await prisma.user.findUnique({
+            where: { email },
+            include: {
+                role: true,
+                subscription: true
+            }
+        });
+        
+        if (!user) {
+            return res.status(401).json({ 
+                success: false, 
+                message: 'Invalid credentials' 
+            });
+        }
+        
+        if (user.role.name !== 'admin') {
+            return res.status(403).json({ 
+                success: false, 
+                message: 'Access denied. Admin privileges required.' 
+            });
+        }
+        
+        const isPasswordValid = await bcrypt.compare(password, user.password);
+        
+        if (!isPasswordValid) {
+            return res.status(401).json({ 
+                success: false, 
+                message: 'Invalid credentials' 
+            });
+        }
+        
+        if (user.status !== 'active') {
+            return res.status(401).json({ 
+                success: false, 
+                message: 'Account is inactive' 
+            });
+        }
+        
+        await prisma.auditLog.create({
+            data: {
+                userId: user.id,
+                action: 'ADMIN_LOGIN',
+                details: 'Admin user logged in via admin portal',
+                ipAddress: req.ip,
+                userAgent: req.headers['user-agent']
+            }
+        });
+        
+        const token = jwt.sign(
+            { 
+                id: user.id, 
+                email: user.email,
+                name: user.name,
+                role: user.role.name,
+                isAdmin: true
+            },
+            process.env.JWT_SECRET || 'your-secret-key',
+            { expiresIn: '1d' }
+        );
+        
+        res.json({
+            success: true,
+            data: {
+                id: user.id,
+                email: user.email,
+                name: user.name,
+                role: user.role.name,
+                isAdmin: true,
+                token: token
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
 
-// ===== TRANSACTION ROUTES =====
-app.get('/api/transactions', protect, requireSubscription('basic'), checkPermission('transaction', 'read'), getTransactions);
-app.get('/api/transactions/:id', protect, requireSubscription('basic'), checkPermission('transaction', 'read'), getTransaction);
-app.post('/api/transactions', protect, requireSubscription('basic'), checkPermission('transaction', 'create'), transactionCreateValidation, validateRequest, createTransaction);
-app.put('/api/transactions/:id', protect, requireSubscription('basic'), checkPermission('transaction', 'update'), transactionUpdateValidation, validateRequest, updateTransaction);
-app.delete('/api/transactions/:id', protect, requireSubscription('basic'), checkPermission('transaction', 'delete'), deleteTransaction);
+app.get('/api/admin/users', protect, authorize('admin'), async (req, res) => {
+    try {
+        const users = await prisma.user.findMany({
+            select: {
+                id: true,
+                email: true,
+                name: true,
+                status: true,
+                roleId: true,
+                role: {
+                    select: {
+                        name: true
+                    }
+                },
+                subscription: {
+                    select: {
+                        plan: true,
+                        status: true,
+                        endDate: true
+                    }
+                },
+                createdAt: true
+            },
+            orderBy: {
+                createdAt: 'desc'
+            }
+        });
+        
+        res.json({ success: true, data: users });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
 
-// ===== DASHBOARD ROUTES =====
-app.get('/api/dashboard/summary', protect, requireSubscription('basic'), checkPermission('dashboard', 'read'), getDashboardSummary);
-app.get('/api/dashboard/category-totals', protect, requireSubscription('basic'), checkPermission('dashboard', 'read'), getCategoryWiseTotals);
-app.get('/api/dashboard/monthly-trends', protect, requireSubscription('basic'), checkPermission('dashboard', 'read'), getMonthlyTrends);
-app.get('/api/dashboard/recent-activity', protect, requireSubscription('basic'), checkPermission('dashboard', 'read'), getRecentActivity);
-app.get('/api/dashboard/complete', protect, requireSubscription('basic'), checkPermission('dashboard', 'read'), getCompleteDashboard);
+app.put('/api/admin/users/:id', protect, authorize('admin'), async (req, res) => {
+    try {
+        const { status, roleId } = req.body;
+        const userId = parseInt(req.params.id);
+        
+        const user = await prisma.user.update({
+            where: { id: userId },
+            data: {
+                ...(status && { status }),
+                ...(roleId && { roleId: parseInt(roleId) })
+            },
+            include: {
+                role: true
+            }
+        });
+        
+        await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action: 'ADMIN_UPDATE_USER',
+                details: 'Admin updated user: ' + user.email
+            }
+        });
+        
+        res.json({ 
+            success: true, 
+            data: {
+                id: user.id,
+                email: user.email,
+                name: user.name,
+                status: user.status,
+                role: user.role.name
+            }
+        });
+    } catch (error) {
+        if (error.code === 'P2025') {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
 
-// ===== SETTINGS ROUTES =====
+app.delete('/api/admin/users/:id', protect, authorize('admin'), async (req, res) => {
+    try {
+        const userId = parseInt(req.params.id);
+        
+        if (userId === req.user.id) {
+            return res.status(403).json({ 
+                success: false, 
+                message: 'You cannot delete your own admin account.' 
+            });
+        }
+        
+        await prisma.user.delete({
+            where: { id: userId }
+        });
+        
+        await prisma.auditLog.create({
+            data: {
+                userId: req.user.id,
+                action: 'ADMIN_DELETE_USER',
+                details: 'Admin deleted user ID: ' + userId
+            }
+        });
+        
+        res.json({ success: true, message: 'User deleted successfully' });
+    } catch (error) {
+        if (error.code === 'P2025') {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ==============================================
+// ACCOUNT ROUTES
+// ==============================================
+app.get('/api/accounts', protect, getAccounts);
+app.get('/api/accounts/:id', protect, getAccount);
+app.post('/api/accounts', protect, accountCreateValidation, validateRequest, createAccount);
+app.put('/api/accounts/:id', protect, accountUpdateValidation, validateRequest, updateAccount);
+app.delete('/api/accounts/:id', protect, deleteAccount);
+
+// ==============================================
+// TRANSACTION ROUTES
+// ==============================================
+app.get('/api/transactions', protect, checkPermission('transaction', 'read'), getTransactions);
+app.get('/api/transactions/:id', protect, checkPermission('transaction', 'read'), getTransaction);
+app.post('/api/transactions', protect, checkPermission('transaction', 'create'), transactionCreateValidation, validateRequest, createTransaction);
+app.put('/api/transactions/:id', protect, checkPermission('transaction', 'update'), transactionUpdateValidation, validateRequest, updateTransaction);
+app.delete('/api/transactions/:id', protect, checkPermission('transaction', 'delete'), deleteTransaction);
+
+// ==============================================
+// DASHBOARD ROUTES
+// ==============================================
+app.get('/api/dashboard/summary', protect, checkPermission('dashboard', 'read'), getDashboardSummary);
+app.get('/api/dashboard/category-totals', protect, checkPermission('dashboard', 'read'), getCategoryWiseTotals);
+app.get('/api/dashboard/monthly-trends', protect, checkPermission('dashboard', 'read'), getMonthlyTrends);
+app.get('/api/dashboard/recent-activity', protect, checkPermission('dashboard', 'read'), getRecentActivity);
+app.get('/api/dashboard/complete', protect, checkPermission('dashboard', 'read'), getCompleteDashboard);
+
+// ==============================================
+// SETTINGS ROUTES
+// ==============================================
 app.get('/api/settings', protect, getSettings);
 app.put('/api/settings', protect, updateSettings);
 app.get('/api/audit-logs', protect, getAuditLogs);
